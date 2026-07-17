@@ -296,7 +296,10 @@ impl From<WalError> for SlateDBError {
         match value {
             WalError::Fenced => SlateDBError::Fenced,
             WalError::IoError(err) => SlateDBError::IoError(err),
-            WalError::InternalError(_err) => SlateDBError::InvalidDBState,
+            WalError::InternalError(err) => {
+                warn!("WAL internal error: {err:?}");
+                SlateDBError::InvalidDBState
+            }
             WalError::WalTruncated => SlateDBError::InvalidDBState,
             WalError::SlateDBError(err) => match err.downcast_ref::<SlateDBError>() {
                 Some(err) => err.clone(),

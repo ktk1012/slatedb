@@ -23,11 +23,14 @@ use crate::wal::{
 };
 use async_trait::async_trait;
 use codec::encode_fence;
+use rdkafka::client::{ClientContext, OAuthToken};
 use rdkafka::config::ClientConfig;
+use rdkafka::consumer::ConsumerContext;
 use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 use rdkafka::producer::{FutureProducer, Producer};
 use rdkafka::util::Timeout;
 use slatedb_common::clock::{DefaultSystemClock, SystemClock};
+use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,6 +39,50 @@ use writer::enqueue_with_retry;
 /// Default interval between Kafka WAL transaction commits.
 pub const DEFAULT_COMMIT_INTERVAL: Duration = Duration::from_millis(100);
 const PARTITION: i32 = 0;
+
+/// Generates OAuth bearer tokens for Kafka clients.
+///
+/// Implementations are called synchronously by librdkafka and should bound how
+/// long token generation can block. This hook is primarily intended for cloud
+/// Kafka services such as Amazon MSK IAM.
+pub trait KafkaOAuthTokenProvider: Send + Sync + 'static {
+    /// Returns a token suitable for librdkafka's `OAUTHBEARER` mechanism.
+    fn generate_oauth_token(&self) -> Result<OAuthToken, Box<dyn Error>>;
+}
+
+#[derive(Clone, Default)]
+struct KafkaClientContext {
+    oauth_token_provider: Option<Arc<dyn KafkaOAuthTokenProvider>>,
+}
+
+impl ClientContext for KafkaClientContext {
+    const ENABLE_REFRESH_OAUTH_TOKEN: bool = true;
+
+    fn error(&self, error: KafkaError, reason: &str) {
+        if !matches!(
+            error,
+            KafkaError::PartitionEOF(_) | KafkaError::Global(RDKafkaErrorCode::PartitionEOF)
+        ) {
+            log::error!("librdkafka: {error}: {reason}");
+        }
+    }
+
+    fn generate_oauth_token(
+        &self,
+        _oauthbearer_config: Option<&str>,
+    ) -> Result<OAuthToken, Box<dyn Error>> {
+        self.oauth_token_provider
+            .as_ref()
+            .ok_or_else(|| -> Box<dyn Error> {
+                "Kafka OAuth token provider is not configured".into()
+            })?
+            .generate_oauth_token()
+    }
+}
+
+impl ConsumerContext for KafkaClientContext {}
+
+type KafkaFutureProducer = FutureProducer<KafkaClientContext>;
 
 /// Kafka WAL factory implementing both writer initialization and WAL reads.
 #[derive(Clone)]
@@ -46,6 +93,7 @@ pub struct KafkaWal {
     consumer_config: ClientConfig,
     commit_interval: Duration,
     clock: Arc<dyn SystemClock>,
+    client_context: KafkaClientContext,
 }
 
 impl KafkaWal {
@@ -96,6 +144,49 @@ impl KafkaWal {
         consumer_config: ClientConfig,
         commit_interval: Duration,
     ) -> Self {
+        Self::from_configs_and_context(
+            topic,
+            transactional_id,
+            producer_config,
+            consumer_config,
+            commit_interval,
+            KafkaClientContext::default(),
+        )
+    }
+
+    /// Creates a Kafka WAL from custom librdkafka configurations and an OAuth
+    /// token provider.
+    ///
+    /// The supplied configurations should set `sasl.mechanism` to
+    /// `OAUTHBEARER`. The provider is shared by the WAL producer and readers.
+    pub fn from_configs_with_oauth_provider(
+        topic: impl Into<String>,
+        transactional_id: impl Into<String>,
+        producer_config: ClientConfig,
+        consumer_config: ClientConfig,
+        commit_interval: Duration,
+        oauth_token_provider: Arc<dyn KafkaOAuthTokenProvider>,
+    ) -> Self {
+        Self::from_configs_and_context(
+            topic,
+            transactional_id,
+            producer_config,
+            consumer_config,
+            commit_interval,
+            KafkaClientContext {
+                oauth_token_provider: Some(oauth_token_provider),
+            },
+        )
+    }
+
+    fn from_configs_and_context(
+        topic: impl Into<String>,
+        transactional_id: impl Into<String>,
+        producer_config: ClientConfig,
+        consumer_config: ClientConfig,
+        commit_interval: Duration,
+        client_context: KafkaClientContext,
+    ) -> Self {
         assert!(
             !commit_interval.is_zero(),
             "Kafka WAL commit interval must be non-zero"
@@ -107,6 +198,7 @@ impl KafkaWal {
             consumer_config,
             commit_interval,
             clock: Arc::new(DefaultSystemClock::new()),
+            client_context,
         }
     }
 
@@ -116,20 +208,26 @@ impl KafkaWal {
             self.topic.clone(),
             self.consumer_config.clone(),
             self.clock.clone(),
+            self.client_context.clone(),
         )
     }
 
-    fn create_producer(&self) -> Result<FutureProducer, WalError> {
+    fn create_producer(&self) -> Result<KafkaFutureProducer, WalError> {
         let mut config = self.producer_config.clone();
         config
             .set("transactional.id", &self.transactional_id)
             .set("enable.idempotence", "true")
             .set("acks", "all")
             .set("allow.auto.create.topics", "false");
-        config.create().map_err(kafka_to_wal_error)
+        config
+            .create_with_context(self.client_context.clone())
+            .map_err(kafka_to_wal_error)
     }
 
-    async fn initialize_transactions(&self, producer: &FutureProducer) -> Result<(), WalError> {
+    async fn initialize_transactions(
+        &self,
+        producer: &KafkaFutureProducer,
+    ) -> Result<(), WalError> {
         let blocking_producer = producer.clone();
         #[allow(clippy::disallowed_methods)]
         tokio::task::spawn_blocking(move || blocking_producer.init_transactions(Timeout::Never))
@@ -142,7 +240,7 @@ impl KafkaWal {
             .map_err(|error| producer_to_wal_error(producer, error))
     }
 
-    async fn verify_topic(&self, producer: &FutureProducer) -> Result<(), WalError> {
+    async fn verify_topic(&self, producer: &KafkaFutureProducer) -> Result<(), WalError> {
         let producer = producer.clone();
         let topic_name = self.topic.clone();
         #[allow(clippy::disallowed_methods)]
@@ -174,7 +272,7 @@ impl KafkaWal {
         .map_err(|error| internal_error(format!("Kafka metadata task failed: {error}")))?
     }
 
-    async fn commit_transaction(&self, producer: &FutureProducer) -> Result<(), WalError> {
+    async fn commit_transaction(&self, producer: &KafkaFutureProducer) -> Result<(), WalError> {
         let blocking_producer = producer.clone();
         #[allow(clippy::disallowed_methods)]
         tokio::task::spawn_blocking(move || blocking_producer.commit_transaction(Timeout::Never))
@@ -275,7 +373,7 @@ fn kafka_to_wal_error(error: KafkaError) -> WalError {
     }
 }
 
-fn producer_to_wal_error(producer: &FutureProducer, error: KafkaError) -> WalError {
+fn producer_to_wal_error(producer: &KafkaFutureProducer, error: KafkaError) -> WalError {
     if is_fencing_error(error.rdkafka_error_code())
         || producer
             .client()

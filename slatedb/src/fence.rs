@@ -2,11 +2,11 @@ use crate::dispatcher::MessageHandlerExecutor;
 use crate::error::SlateDBError;
 use crate::manifest::store::{FenceableManifest, StoredManifest};
 use crate::tablestore::TableStore;
-use crate::{wal, Settings};
-use fail_parallel::{fail_point_send, FailPointTx};
 use crate::utils::WatchableOnceCellReader;
 use crate::wal::writer_init::WalWriterInit;
 use crate::wal::{WalIterator, WalWriter};
+use crate::{wal, Settings};
+use fail_parallel::{fail_point_send, FailPointTx};
 use slatedb_common::metrics::MetricsRecorderHelper;
 use slatedb_common::SystemClock;
 use std::sync::Arc;
@@ -99,7 +99,8 @@ impl WriterFencer {
                     stored_manifest.manifest(),
                     self.task_executor.clone(),
                     self.fp_tx.clone(),
-                ).await?
+                )
+                .await?,
             ),
             Some(wal_writer_init) => wal_writer_init,
         };
@@ -594,10 +595,7 @@ mod tests {
             .await
             .unwrap()
             .expect("expected the replay iterator to contain the fencing WAL");
-        assert_eq!(
-            first_replayed_wal.last_wal_file_id,
-            replay_after_wal_id + 1
-        );
+        assert_eq!(first_replayed_wal.last_wal_file_id, replay_after_wal_id + 1);
 
         // verify that fenced db is fenced (new write fails)
         use crate::error::{CloseReason, ErrorKind};

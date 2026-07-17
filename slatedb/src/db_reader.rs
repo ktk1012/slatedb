@@ -30,7 +30,9 @@ use crate::{Checkpoint, DbIterator};
 use crate::{DbCacheManagerOps, DbMetadataOps, DbReadOps};
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::future::BoxFuture;
 use futures::stream::BoxStream;
+use futures::FutureExt;
 use log::{info, warn};
 use object_store::path::Path;
 use object_store::ObjectStore;
@@ -40,8 +42,6 @@ use slatedb_common::DbRand;
 use std::collections::{BTreeSet, VecDeque};
 use std::ops::{Bound, Sub};
 use std::sync::Arc;
-use futures::future::BoxFuture;
-use futures::FutureExt;
 use tokio::runtime::Handle;
 use tokio::sync::watch;
 use uuid::Uuid;
@@ -134,7 +134,7 @@ struct SpScRegisterReceiver<T> {
     notifier: Arc<tokio::sync::Notify>,
 }
 
-impl <T> SpScRegisterReceiver<T> {
+impl<T> SpScRegisterReceiver<T> {
     async fn recv(&self) -> T {
         loop {
             if let Some(value) = self.value.lock().take() {
@@ -150,7 +150,7 @@ struct SpScRegisterSender<T> {
     notifier: Arc<tokio::sync::Notify>,
 }
 
-impl <T> SpScRegisterSender<T> {
+impl<T> SpScRegisterSender<T> {
     fn replace(&self, value: T) -> Option<T> {
         let old = self.value.lock().replace(value);
         self.notifier.notify_one();
@@ -162,7 +162,10 @@ fn spsc_register<T>() -> (SpScRegisterSender<T>, SpScRegisterReceiver<T>) {
     let value = Arc::new(Mutex::new(None));
     let notifier = Arc::new(tokio::sync::Notify::new());
     (
-        SpScRegisterSender { value: value.clone(), notifier: notifier.clone() },
+        SpScRegisterSender {
+            value: value.clone(),
+            notifier: notifier.clone(),
+        },
         SpScRegisterReceiver { value, notifier },
     )
 }
@@ -1120,9 +1123,7 @@ impl ManifestPoller {
             .checked_add(1)
             .ok_or_else(|| WalError::from(SlateDBError::InvalidDBState))?;
         let iterator = self.wal_reader.iterator((start_wal_id..).into()).await?;
-        let previous = self
-            .wal_iterator_tx
-            .replace(iterator);
+        let previous = self.wal_iterator_tx.replace(iterator);
         if let Some(mut previous) = previous {
             previous.close().await?;
         }

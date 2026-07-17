@@ -1,5 +1,5 @@
 use super::codec::{decode_record, DecodedRecord};
-use super::{internal_error, kafka_to_wal_error, PARTITION};
+use super::{internal_error, kafka_to_wal_error, KafkaClientContext, PARTITION};
 use crate::wal::{WalError, WalFileRange, WalIterator, WalReader, WalRows};
 use async_trait::async_trait;
 use rdkafka::config::ClientConfig;
@@ -22,6 +22,7 @@ pub struct KafkaWalReader {
     topic: String,
     consumer_config: ClientConfig,
     clock: Arc<dyn SystemClock>,
+    client_context: KafkaClientContext,
 }
 
 impl KafkaWalReader {
@@ -29,15 +30,17 @@ impl KafkaWalReader {
         topic: String,
         consumer_config: ClientConfig,
         clock: Arc<dyn SystemClock>,
+        client_context: KafkaClientContext,
     ) -> Self {
         Self {
             topic,
             consumer_config,
             clock,
+            client_context,
         }
     }
 
-    fn create_consumer(&self) -> Result<StreamConsumer, WalError> {
+    fn create_consumer(&self) -> Result<StreamConsumer<KafkaClientContext>, WalError> {
         let reader_id = NEXT_READER_ID.fetch_add(1, Ordering::Relaxed);
         let mut config = self.consumer_config.clone();
         config
@@ -54,7 +57,9 @@ impl KafkaWalReader {
             .set("isolation.level", "read_committed")
             .set("enable.partition.eof", "true")
             .set("allow.auto.create.topics", "false");
-        config.create().map_err(kafka_to_wal_error)
+        config
+            .create_with_context(self.client_context.clone())
+            .map_err(kafka_to_wal_error)
     }
 }
 
@@ -86,18 +91,16 @@ impl WalReader for KafkaWalReader {
             end_offset: end,
             clock: self.clock.clone(),
         };
-        if !iterator.exhausted() {
-            let (low, _) = iterator.watermarks().await?;
-            if start < low {
-                return Err(WalError::WalTruncated);
-            }
-        }
+        // Do not issue a blocking metadata request before the stream has been
+        // polled. OAuth refresh callbacks are served by consumer polling, and
+        // a pre-poll request can otherwise deadlock waiting for credentials.
+        // Retention truncation is still detected below on an offset gap or EOF.
         Ok(Box::new(iterator))
     }
 }
 
 pub struct KafkaWalIterator {
-    consumer: Arc<StreamConsumer>,
+    consumer: Arc<StreamConsumer<KafkaClientContext>>,
     topic: String,
     next_offset: u64,
     end_offset: Option<u64>,

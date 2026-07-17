@@ -1,11 +1,11 @@
 use super::codec::encode_write_batch;
 use super::observer::SharedWalStatus;
-use super::{internal_error, producer_to_wal_error, PARTITION};
+use super::{internal_error, producer_to_wal_error, KafkaFutureProducer, PARTITION};
 use crate::wal::{FlushResultFuture, WalError, WalObserver, WalStatus, WalWriter};
 use crate::RowEntry;
 use futures::FutureExt;
 use rdkafka::error::{KafkaError, RDKafkaErrorCode};
-use rdkafka::producer::{DeliveryFuture, FutureProducer, FutureRecord, Producer};
+use rdkafka::producer::{DeliveryFuture, FutureRecord, Producer};
 use rdkafka::util::Timeout;
 use slatedb_common::clock::SystemClock;
 use std::sync::Arc;
@@ -25,7 +25,7 @@ pub struct KafkaWalWriter {
 
 impl KafkaWalWriter {
     pub(super) fn start(
-        producer: FutureProducer,
+        producer: KafkaFutureProducer,
         topic: String,
         epoch: u64,
         commit_interval: Duration,
@@ -161,7 +161,7 @@ struct PendingRecord {
 }
 
 struct WriterWorker {
-    producer: FutureProducer,
+    producer: KafkaFutureProducer,
     topic: String,
     commit_interval: Duration,
     commands: mpsc::Receiver<WriterCommand>,
@@ -301,7 +301,7 @@ impl WriterCommand {
 }
 
 pub(super) async fn enqueue_with_retry(
-    producer: &FutureProducer,
+    producer: &KafkaFutureProducer,
     topic: &str,
     encoded: &[u8],
     clock: &dyn SystemClock,
