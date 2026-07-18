@@ -962,6 +962,7 @@ impl CompactorState {
             sequence_tracker: remote_manifest.value.core.sequence_tracker,
         };
         remote_manifest.value.core = merged;
+        remote_manifest.value.prune_external_sst_ids();
         self.manifest = remote_manifest;
     }
 

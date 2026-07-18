@@ -977,8 +977,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_manifest_safely_retries_on_version_conflict() {
-        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    async fn write_manifest_safely_preserves_external_prune_across_version_conflict() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let gated = Arc::new(crate::test_utils::GatedObjectStore::new(Arc::clone(&inner)));
+        let object_store: Arc<dyn ObjectStore> = gated.clone();
         let manifest_store = Arc::new(ManifestStore::new(
             &Path::from(ROOT),
             Arc::clone(&object_store),
@@ -988,21 +990,42 @@ mod tests {
             Arc::clone(&object_store),
         ));
         let system_clock: Arc<dyn SystemClock> = Arc::new(DefaultSystemClock::new());
+        let external_sst_id = SsTableId::Compacted(Ulid::from_parts(42, 0));
+        let external_sst_view = crate::db_state::SsTableView::identity(SsTableHandle::new(
+            external_sst_id,
+            SST_FORMAT_VERSION_LATEST,
+            SsTableInfo {
+                first_entry: Some(Bytes::from_static(b"external")),
+                ..SsTableInfo::default()
+            },
+        ));
+        let external_sst_view_id = external_sst_view.id;
+        let mut core = ManifestCore::new();
+        Arc::make_mut(&mut core.tree)
+            .l0
+            .push_back(external_sst_view);
 
-        StoredManifest::create_new_db(
-            manifest_store.clone(),
-            ManifestCore::new(),
-            system_clock.clone(),
-        )
-        .await
-        .unwrap();
+        StoredManifest::create_new_db(manifest_store.clone(), core, system_clock.clone())
+            .await
+            .unwrap();
+        let mut stored_manifest =
+            StoredManifest::load(manifest_store.clone(), system_clock.clone())
+                .await
+                .unwrap();
+        let mut dirty = stored_manifest.prepare_dirty().unwrap();
+        dirty.value.external_dbs = vec![crate::manifest::ExternalDb {
+            path: "/source/db".to_owned(),
+            source_checkpoint_id: uuid::Uuid::new_v4(),
+            final_checkpoint_id: Some(uuid::Uuid::new_v4()),
+            sst_ids: vec![external_sst_id],
+        }];
+        stored_manifest.update(dirty).await.unwrap();
 
         let options = CompactorOptions::default();
         let rand = Arc::new(DbRand::new(7));
-
         let mut writer = CompactorStateWriter::new(
             manifest_store.clone(),
-            compactions_store.clone(),
+            compactions_store,
             system_clock,
             &options,
             rand,
@@ -1010,28 +1033,72 @@ mod tests {
         .await
         .unwrap();
 
-        // Record the version after fencing.
-        let start_id = manifest_store.read_latest_manifest().await.unwrap().id;
+        let compaction_id = Ulid::from_parts(43, 0);
+        writer
+            .state
+            .add_compaction(Compaction::new(
+                compaction_id,
+                CompactionSpec::new(
+                    vec![crate::compactor_state::SourceId::SstView(
+                        external_sst_view_id,
+                    )],
+                    0,
+                ),
+            ))
+            .unwrap();
+        writer.state.finish_compaction(
+            compaction_id,
+            crate::db_state::SortedRun {
+                id: 0,
+                sst_views: vec![crate::db_state::SsTableView::identity(SsTableHandle::new(
+                    SsTableId::Compacted(Ulid::from_parts(44, 0)),
+                    SST_FORMAT_VERSION_LATEST,
+                    SsTableInfo {
+                        first_entry: Some(Bytes::from_static(b"clone-owned")),
+                        ..SsTableInfo::default()
+                    },
+                ))],
+            },
+        );
+        assert!(writer.state.manifest().value.external_dbs[0]
+            .sst_ids
+            .is_empty());
 
-        // Simulate an external writer creating a checkpoint of the manifest and updating it.
-        let admin = AdminBuilder::new(ROOT, object_store.clone()).build();
+        let start_id = manifest_store.read_latest_manifest().await.unwrap().id;
+        let start_arrivals = gated.put_opts_gate.arrivals();
+        gated.put_opts_gate.close();
+        let write = tokio::spawn(async move {
+            writer.write_manifest_safely().await.unwrap();
+        });
+        gated
+            .put_opts_gate
+            .wait_for_arrivals(start_arrivals + 1)
+            .await;
+
+        let admin = AdminBuilder::new(ROOT, inner).build();
         admin
             .create_detached_checkpoint(&CheckpointOptions::default())
             .await
-            .expect("create checkpoint failed");
+            .expect("create conflicting checkpoint failed");
+        assert_eq!(
+            manifest_store.read_latest_manifest().await.unwrap().id,
+            start_id + 1
+        );
 
-        let conflicting_id = manifest_store.read_latest_manifest().await.unwrap().id;
-        assert_eq!(conflicting_id, start_id + 1);
+        gated.put_opts_gate.release();
+        write.await.unwrap();
 
-        // This should retry on conflict and succeed with a new version.
-        writer.write_manifest_safely().await.unwrap();
-
-        let final_id = manifest_store.read_latest_manifest().await.unwrap().id;
-        // write_manifest_safely now bumps the manifest twice per successful call because write_manifest
-        // writes a checkpoint first:
-        // - write_manifest() calls self.manifest.write_checkpoint(...) to create the checkpoint, then
-        // - write_manifest() calls self.manifest.update(...) to update the manifest
-        // So we do +1 for the external update and +2 for the successful write_manifest_safely call.
-        assert_eq!(final_id, start_id + 3);
+        let latest = admin
+            .read_manifest(None)
+            .await
+            .unwrap()
+            .expect("latest manifest missing");
+        assert_eq!(latest.external_dbs().len(), 1);
+        assert!(latest.external_dbs()[0].sst_ids.is_empty());
+        assert_eq!(
+            manifest_store.read_latest_manifest().await.unwrap().id,
+            start_id + 3
+        );
+        assert_eq!(gated.put_opts_gate.arrivals(), start_arrivals + 3);
     }
 }
