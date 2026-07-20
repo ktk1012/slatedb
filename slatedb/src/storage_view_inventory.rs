@@ -64,6 +64,39 @@ pub struct StorageViewInventory {
     pub observed_revisions: Vec<StorageViewRevision>,
 }
 
+/// Failure while resolving an exact checkpoint-backed storage view.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum StorageViewInventoryError {
+    /// A latest manifest changed while the inventory graph was being captured.
+    #[error(
+        "storage view revision changed. db_path=`{db_path}`, expected=`{expected}`, observed=`{observed}`"
+    )]
+    RevisionChanged {
+        db_path: String,
+        expected: u64,
+        observed: u64,
+    },
+    /// An explicit root or external checkpoint no longer exists.
+    #[error("checkpoint missing. db_path=`{db_path}`, checkpoint_id=`{checkpoint_id}`")]
+    CheckpointMissing {
+        db_path: String,
+        checkpoint_id: Uuid,
+    },
+    /// Persisted clone metadata cannot describe one unambiguous storage view.
+    #[error("invalid storage view graph: {reason}")]
+    InvalidGraph { reason: &'static str },
+    /// Any other SlateDB storage or data error.
+    #[error(transparent)]
+    SlateDb(#[from] crate::Error),
+}
+
+impl From<SlateDBError> for StorageViewInventoryError {
+    fn from(error: SlateDBError) -> Self {
+        Self::SlateDb(error.into())
+    }
+}
+
 impl Admin {
     /// Resolve an explicit checkpoint to its exact manifest, bounded WAL, local SST,
     /// external SST, and external final-checkpoint pin graph.
@@ -73,11 +106,11 @@ impl Admin {
     pub async fn read_storage_view_inventory(
         &self,
         checkpoint_id: Uuid,
-    ) -> Result<StorageViewInventory, crate::Error> {
+    ) -> Result<StorageViewInventory, StorageViewInventoryError> {
         let main_store = self.object_stores.store_of(ObjectStoreType::Main).clone();
         let root_store = ManifestStore::new(&self.path, main_store.clone());
         let root_latest = root_store.read_latest_manifest().await?;
-        let checkpoint = find_checkpoint(root_latest.checkpoints(), checkpoint_id)?;
+        let checkpoint = find_checkpoint(root_latest.checkpoints(), checkpoint_id, &self.path)?;
         let checkpoint_manifest = root_store.read_manifest(checkpoint.manifest_id).await?;
 
         let mut objects = BTreeSet::new();
@@ -126,14 +159,20 @@ impl Admin {
             .iter()
             .filter(|external_db| !external_db.sst_ids.is_empty())
         {
-            let final_checkpoint_id = external_db
-                .final_checkpoint_id
-                .ok_or(SlateDBError::InvalidDBState)?;
+            let final_checkpoint_id =
+                external_db
+                    .final_checkpoint_id
+                    .ok_or(StorageViewInventoryError::InvalidGraph {
+                        reason: "external DB is missing its final checkpoint",
+                    })?;
             let source_path = Path::from(external_db.path.clone());
             let source_store = ManifestStore::new(&source_path, main_store.clone());
             let source_latest = source_store.read_latest_manifest().await?;
-            let final_checkpoint =
-                find_checkpoint(source_latest.checkpoints(), final_checkpoint_id)?;
+            let final_checkpoint = find_checkpoint(
+                source_latest.checkpoints(),
+                final_checkpoint_id,
+                &source_path,
+            )?;
 
             objects.insert(manifest_object(&source_path, final_checkpoint.manifest_id));
             external_checkpoint_pins.insert(ExternalCheckpointPin {
@@ -163,14 +202,18 @@ impl Admin {
     }
 }
 
-fn find_checkpoint(
-    checkpoints: &[Checkpoint],
+fn find_checkpoint<'a>(
+    checkpoints: &'a [Checkpoint],
     checkpoint_id: Uuid,
-) -> Result<&Checkpoint, SlateDBError> {
+    db_path: &Path,
+) -> Result<&'a Checkpoint, StorageViewInventoryError> {
     checkpoints
         .iter()
         .find(|checkpoint| checkpoint.id == checkpoint_id)
-        .ok_or(SlateDBError::CheckpointMissing(checkpoint_id))
+        .ok_or_else(|| StorageViewInventoryError::CheckpointMissing {
+            db_path: db_path.to_string(),
+            checkpoint_id,
+        })
 }
 
 fn manifest_object(path: &Path, manifest_id: u64) -> StorageViewObject {
@@ -187,7 +230,7 @@ fn manifest_object(path: &Path, manifest_id: u64) -> StorageViewObject {
 
 fn external_sst_paths(
     manifest: &crate::manifest::Manifest,
-) -> Result<HashMap<SsTableId, Path>, SlateDBError> {
+) -> Result<HashMap<SsTableId, Path>, StorageViewInventoryError> {
     let mut paths = HashMap::new();
     for external_db in &manifest.external_dbs {
         for sst_id in &external_db.sst_ids {
@@ -195,7 +238,9 @@ fn external_sst_paths(
                 .insert(*sst_id, Path::from(external_db.path.clone()))
                 .is_some()
             {
-                return Err(SlateDBError::InvalidDBState);
+                return Err(StorageViewInventoryError::InvalidGraph {
+                    reason: "duplicate external SST identity",
+                });
             }
         }
     }
@@ -206,7 +251,7 @@ async fn verify_revisions(
     root_path: &Path,
     object_stores: &ObjectStores,
     expected: &BTreeMap<String, u64>,
-) -> Result<(), SlateDBError> {
+) -> Result<(), StorageViewInventoryError> {
     let main_store = object_stores.store_of(ObjectStoreType::Main).clone();
     for (db_path, expected_id) in expected {
         let path = if db_path == &root_path.to_string() {
@@ -218,8 +263,85 @@ async fn verify_revisions(
             .read_latest_manifest()
             .await?;
         if observed.id() != *expected_id {
-            return Err(SlateDBError::InvalidDBState);
+            return Err(StorageViewInventoryError::RevisionChanged {
+                db_path: db_path.clone(),
+                expected: *expected_id,
+                observed: observed.id(),
+            });
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::manifest::store::StoredManifest;
+    use crate::manifest::{ExternalDb, Manifest, ManifestCore};
+    use object_store::memory::InMemory;
+    use object_store::ObjectStore;
+    use slatedb_common::clock::DefaultSystemClock;
+    use std::sync::Arc;
+    use ulid::Ulid;
+
+    #[test]
+    fn invalid_graph_is_not_classified_as_revision_change() {
+        let sst_id = SsTableId::Compacted(Ulid::from_parts(1, 0));
+        let mut manifest = Manifest::initial(ManifestCore::new());
+        manifest.external_dbs = vec![
+            ExternalDb {
+                path: "source-a".into(),
+                source_checkpoint_id: Uuid::from_u128(1),
+                final_checkpoint_id: Some(Uuid::from_u128(2)),
+                sst_ids: vec![sst_id],
+            },
+            ExternalDb {
+                path: "source-b".into(),
+                source_checkpoint_id: Uuid::from_u128(3),
+                final_checkpoint_id: Some(Uuid::from_u128(4)),
+                sst_ids: vec![sst_id],
+            },
+        ];
+
+        assert!(matches!(
+            external_sst_paths(&manifest),
+            Err(StorageViewInventoryError::InvalidGraph { .. })
+        ));
+    }
+
+    #[test]
+    fn missing_checkpoint_preserves_identity_without_retry_classification() {
+        let checkpoint_id = Uuid::from_u128(1);
+        assert!(matches!(
+            find_checkpoint(&[], checkpoint_id, &Path::from("root")),
+            Err(StorageViewInventoryError::CheckpointMissing {
+                db_path,
+                checkpoint_id: observed,
+            }) if db_path == "root" && observed == checkpoint_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn revision_mismatch_is_the_only_typed_retry_signal() {
+        let root = Path::from("root");
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let manifest_store = Arc::new(ManifestStore::new(&root, store.clone()));
+        StoredManifest::create_new_db(
+            manifest_store,
+            ManifestCore::new(),
+            Arc::new(DefaultSystemClock::new()),
+        )
+        .await
+        .unwrap();
+        let stores = ObjectStores::new(store, None);
+
+        assert!(matches!(
+            verify_revisions(&root, &stores, &BTreeMap::from([("root".into(), 0)])).await,
+            Err(StorageViewInventoryError::RevisionChanged {
+                db_path,
+                expected: 0,
+                observed: 1,
+            }) if db_path == "root"
+        ));
+    }
 }
