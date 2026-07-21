@@ -1427,5 +1427,10 @@ mod tests {
             2,
             "clone should have an external database for each parent"
         );
+        assert!(manifest_data
+            .manifest
+            .external_dbs
+            .iter()
+            .all(|external_db| external_db.final_checkpoint_id.is_none()));
     }
 }

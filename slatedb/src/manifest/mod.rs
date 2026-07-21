@@ -9,7 +9,6 @@ use crate::checkpoint::Checkpoint;
 use crate::clone::{CloneSource, SegmentFilterFn, SegmentProjectionFn};
 use crate::error::SlateDBError;
 use crate::seq_tracker::SequenceTracker;
-use crate::utils::IdGenerator;
 use bytes::Bytes;
 use log::{debug, warn};
 use serde::Serialize;
@@ -982,20 +981,16 @@ impl Manifest {
         parent_manifest: &Manifest,
         parent_path: String,
         source_checkpoint_id: Uuid,
-        rand: Arc<DbRand>,
+        _rand: Arc<DbRand>,
     ) -> Self {
         let mut clone_external_dbs = vec![];
 
-        // Carry over each inherited external_db with a fresh final_checkpoint_id.
+        // Carry over inherited file references and their provenance.
         for parent_external_db in &parent_manifest.external_dbs {
             clone_external_dbs.push(ExternalDb {
                 path: parent_external_db.path.clone(),
-                // don't depend on the original source_checkpoint: it was supplied by the user and
-                // might have been deleted; use slatedb-generated final checkpoint instead
-                source_checkpoint_id: parent_external_db
-                    .final_checkpoint_id
-                    .expect("final_checkpoint_id must be present"),
-                final_checkpoint_id: Some(rand.rng().gen_uuid()),
+                source_checkpoint_id: parent_external_db.source_checkpoint_id,
+                final_checkpoint_id: None,
                 sst_ids: parent_external_db.sst_ids.clone(),
             });
         }
@@ -1005,7 +1000,7 @@ impl Manifest {
         clone_external_dbs.push(ExternalDb {
             path: parent_path,
             source_checkpoint_id,
-            final_checkpoint_id: Some(rand.rng().gen_uuid()),
+            final_checkpoint_id: None,
             sst_ids: parent_manifest.owned_ssts(),
         });
 
@@ -1331,8 +1326,8 @@ impl Manifest {
 
     /// Build the union's `external_dbs` list. Forwards every source's
     /// inherited `external_dbs` and adds one entry per source that owns
-    /// SSTs directly. `final_checkpoint_id` is left as `None`; it is
-    /// regenerated after the post-loop deduplication.
+    /// SSTs directly. File retention is owned by the external snapshot
+    /// controller, so new entries never carry a final checkpoint.
     fn build_external_dbs(sources: &[&CloneSource]) -> Vec<ExternalDb> {
         let mut external_dbs = vec![];
         for source in sources {
@@ -1340,11 +1335,7 @@ impl Manifest {
             for parent_external_db in &manifest.external_dbs {
                 external_dbs.push(ExternalDb {
                     path: parent_external_db.path.clone(),
-                    // don't depend on the original source_checkpoint: it was supplied by the user and
-                    // might have been deleted; use slatedb-generated final checkpoint instead
-                    source_checkpoint_id: parent_external_db
-                        .final_checkpoint_id
-                        .expect("final_checkpoint_id must be present"),
+                    source_checkpoint_id: parent_external_db.source_checkpoint_id,
                     final_checkpoint_id: None,
                     sst_ids: parent_external_db.sst_ids.clone(),
                 });
@@ -1392,7 +1383,7 @@ impl Manifest {
 
     pub(crate) fn cloned_from_union(
         sources: Vec<CloneSource>,
-        rand: Arc<DbRand>,
+        _rand: Arc<DbRand>,
     ) -> Result<Manifest, SlateDBError> {
         let mut ranges = vec![];
         for source in &sources {
@@ -1475,7 +1466,7 @@ impl Manifest {
             .map(|((path, sst_ids), source_checkpoint_id)| ExternalDb {
                 path,
                 source_checkpoint_id,
-                final_checkpoint_id: Some(rand.rng().gen_uuid()),
+                final_checkpoint_id: None,
                 sst_ids: sst_ids.into_iter().collect(),
             })
             .collect();
@@ -1635,7 +1626,7 @@ mod tests {
             clone_manifest.external_dbs[0].source_checkpoint_id,
             checkpoint.id
         );
-        assert!(clone_manifest.external_dbs[0].final_checkpoint_id.is_some());
+        assert!(clone_manifest.external_dbs[0].final_checkpoint_id.is_none());
 
         // The clone manifest should not be initialized
         assert!(!clone_manifest.core.initialized);
@@ -1652,14 +1643,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cloned_breaks_chain_via_final_checkpoint() {
-        // When the parent is itself a clone, its external_dbs already carry an entry for
-        // the grandparent. Cloning the parent must NOT propagate the grandparent's
-        // user-supplied source_checkpoint_id forward — the user could delete that
-        // checkpoint at any time, which would invalidate any future clones in the chain.
-        // Instead, the carried-over entry's source_checkpoint_id is set to the parent's
-        // final_checkpoint_id (slatedb-generated and pinned by the parent), breaking the
-        // chain back to the user-supplied checkpoint.
+    fn test_cloned_preserves_provenance_without_final_checkpoints() {
         let rand = Arc::new(DbRand::default());
 
         let grandparent_sst = SsTableId::Compacted(Ulid::new());
@@ -1693,23 +1677,11 @@ mod tests {
             .find(|e| e.path == "/tmp/grandparent")
             .expect("grandparent entry should be carried over");
 
-        // The chain to the user-supplied grandparent_source_cp must be broken:
-        // source_checkpoint_id is now the parent's final_checkpoint_id.
         assert_eq!(
-            grandparent_entry.source_checkpoint_id, grandparent_final_cp,
-            "carried-over source_checkpoint_id must be the parent's final_checkpoint_id"
-        );
-        assert_ne!(
             grandparent_entry.source_checkpoint_id, grandparent_source_cp,
-            "carried-over source_checkpoint_id must not depend on the user-supplied checkpoint"
+            "carried-over source_checkpoint_id must preserve provenance"
         );
-        // A fresh final_checkpoint_id is generated for the new clone's entry.
-        assert!(grandparent_entry.final_checkpoint_id.is_some());
-        assert_ne!(
-            grandparent_entry.final_checkpoint_id,
-            Some(grandparent_final_cp),
-            "final_checkpoint_id must be regenerated for the new clone"
-        );
+        assert!(grandparent_entry.final_checkpoint_id.is_none());
         assert_eq!(grandparent_entry.sst_ids, vec![grandparent_sst]);
 
         // The new immediate-parent entry uses the user-supplied checkpoint as expected.
@@ -1721,15 +1693,12 @@ mod tests {
         assert_eq!(parent_entry.source_checkpoint_id, parent_cp);
         assert_eq!(parent_entry.sst_ids, vec![parent_owned_sst]);
 
-        // The chain-break must hold across the whole clone manifest: no entry
-        // anywhere should still reference the user-supplied grandparent checkpoint.
         assert!(
             cloned
                 .external_dbs
                 .iter()
-                .all(|e| e.source_checkpoint_id != grandparent_source_cp
-                    && e.final_checkpoint_id != Some(grandparent_source_cp)),
-            "no entry in the clone may reference the user-supplied grandparent_source_cp"
+                .all(|e| e.final_checkpoint_id.is_none()),
+            "new clone entries must not own final checkpoints"
         );
     }
 
@@ -2893,19 +2862,11 @@ mod tests {
             .iter()
             .find(|e| e.path == "/tmp/grandparent")
             .unwrap();
-        // The carried-over entry's source_checkpoint_id must be replaced with the
-        // parent's final_checkpoint_id, so the union does not depend on the original
-        // user-supplied grandparent_source_cp (which the user could delete).
-        assert_eq!(grandparent.source_checkpoint_id, grandparent_final_cp);
-        assert_ne!(grandparent.source_checkpoint_id, grandparent_source_cp);
-        // final_checkpoint_id must be regenerated — the union clone owns its own
-        // checkpoint and must not claim ownership over the parent's.
-        assert!(grandparent.final_checkpoint_id.is_some());
-        assert_ne!(
-            grandparent.final_checkpoint_id,
-            Some(grandparent_final_cp),
-            "inherited final_checkpoint_id must be regenerated"
-        );
+        assert_eq!(grandparent.source_checkpoint_id, grandparent_source_cp);
+        assert!(union
+            .external_dbs
+            .iter()
+            .all(|db| db.final_checkpoint_id.is_none()));
 
         // All three SSTs must resolve to their correct source paths
         let external_ssts = union.external_ssts();
@@ -3347,13 +3308,11 @@ mod tests {
             1,
             "identical borrows of the same ancestor must collapse to one entry"
         );
-        // Carry-forward replaces the user-supplied source_cp with the parent's
-        // final_checkpoint_id, and no entry references the user-supplied cp.
-        assert_eq!(shared_entries[0].source_checkpoint_id, original_final_cp);
+        assert_eq!(shared_entries[0].source_checkpoint_id, shared_source_cp);
         assert!(result
             .external_dbs
             .iter()
-            .all(|db| db.source_checkpoint_id != shared_source_cp));
+            .all(|db| db.final_checkpoint_id.is_none()));
 
         let merged_ids: BTreeSet<SsTableId> = shared_entries[0].sst_ids.iter().copied().collect();
         assert_eq!(merged_ids, BTreeSet::from([sst_a, sst_b]));
@@ -3492,10 +3451,8 @@ mod tests {
             "borrows of the same ancestor with identical sst_ids must collapse \
              regardless of differing (rotated) checkpoint ids"
         );
-        assert_eq!(
-            shared_entries[0].source_checkpoint_id, final_cp_2,
-            "with no user-supplied id in the group, the smallest generated id must be kept"
-        );
+        assert_eq!(shared_entries[0].source_checkpoint_id, Uuid::from_u128(101));
+        assert!(shared_entries[0].final_checkpoint_id.is_none());
         let ids: BTreeSet<SsTableId> = shared_entries[0].sst_ids.iter().copied().collect();
         assert_eq!(ids, BTreeSet::from([sst_a, sst_b]));
     }
@@ -3701,18 +3658,22 @@ mod tests {
             vec![
                 (
                     "a-parent",
-                    ancestor_a_final_cp,
+                    Uuid::from_u128(11),
                     vec![ancestor_a_sst1, ancestor_a_sst2],
                 ),
                 ("tmp/db1", source1_cp, vec![source1_sst]),
                 ("tmp/db2", source2_cp, vec![source2_sst]),
                 (
                     "z-parent",
-                    ancestor_z_final_cp,
+                    Uuid::from_u128(31),
                     vec![ancestor_z_sst1, ancestor_z_sst2],
                 ),
             ]
         );
+        assert!(union
+            .external_dbs
+            .iter()
+            .all(|db| db.final_checkpoint_id.is_none()));
     }
 
     fn segment_with_prefix(prefix: &[u8], seed: u64) -> super::Segment {

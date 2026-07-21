@@ -249,9 +249,6 @@ pub(crate) enum SlateDBError {
         checkpoint_id: Option<Uuid>,
     },
 
-    #[error("the final checkpoint for the cloned database no longer exists in the manifest. path=`{path}`, checkpoint_id=`{checkpoint_id}`")]
-    CloneIncorrectFinalCheckpoint { path: String, checkpoint_id: Uuid },
-
     #[error("unknown configuration file format. path=`{0}`")]
     UnknownConfigurationFormat(PathBuf),
 
@@ -703,7 +700,6 @@ impl From<SlateDBError> for Error {
             SlateDBError::ChecksumMismatch { .. } => Error::data(msg),
             SlateDBError::CloneExternalDbMissing => Error::data(msg),
             SlateDBError::CloneIncorrectExternalDbCheckpoint { .. } => Error::data(msg),
-            SlateDBError::CloneIncorrectFinalCheckpoint { .. } => Error::data(msg),
 
             // Internal errors
             SlateDBError::CompactorExecutorFailed => Error::internal(msg),
