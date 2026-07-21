@@ -592,7 +592,7 @@ impl ManifestWriterHandler {
         let mut dirty = self.clone_local_manifest_for_write();
         let mut checkpoint_results = Vec::new();
         for options in checkpoint_options {
-            let id = self.db.rand.rng().gen_uuid();
+            let id = options.id.unwrap_or_else(|| self.db.rand.rng().gen_uuid());
             let checkpoint = self.manifest.new_checkpoint(id, options)?;
             let manifest_id = checkpoint.manifest_id;
             dirty.value.core.checkpoints.push(checkpoint);

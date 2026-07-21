@@ -507,7 +507,7 @@ impl Admin {
             .db_state()
             .validate_wal_object_store_uri(configured_wal_uri.as_deref())?;
 
-        let checkpoint_id = self.rand.rng().gen_uuid();
+        let checkpoint_id = options.id.unwrap_or_else(|| self.rand.rng().gen_uuid());
         let checkpoint = stored_manifest
             .write_checkpoint(checkpoint_id, options)
             .await?;

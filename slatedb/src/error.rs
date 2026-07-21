@@ -179,6 +179,9 @@ pub(crate) enum SlateDBError {
     #[error("checkpoint missing. checkpoint_id=`{0}`")]
     CheckpointMissing(Uuid),
 
+    #[error("checkpoint already exists. checkpoint_id=`{0}`")]
+    CheckpointExists(Uuid),
+
     #[error(
         "unsupported {format_name} format version. supported_versions=`{supported_versions:?}`, actual_version=`{actual_version}`"
     )]
@@ -686,6 +689,7 @@ impl From<SlateDBError> for Error {
             SlateDBError::BlockTransformError => Error::data(msg),
             SlateDBError::InvalidRowFlags { .. } => Error::data(msg),
             SlateDBError::CheckpointMissing(_) => Error::data(msg),
+            SlateDBError::CheckpointExists(_) => Error::data(msg),
             SlateDBError::InvalidVersion { .. } => Error::data(msg),
             SlateDBError::ManifestMissing(_) => Error::data(msg),
             SlateDBError::LatestTransactionalObjectVersionMissing => Error::data(msg),

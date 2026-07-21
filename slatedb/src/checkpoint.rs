@@ -107,6 +107,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_should_create_checkpoint_with_pinned_id_and_reject_duplicate() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("/tmp/test_kv_store");
+        let db = Db::open(path.clone(), object_store.clone()).await.unwrap();
+
+        let pinned = uuid::Uuid::new_v4();
+        let options = CheckpointOptions {
+            id: Some(pinned),
+            ..CheckpointOptions::default()
+        };
+        let CheckpointCreateResult { id, .. } = db
+            .create_checkpoint(CheckpointScope::All, &options)
+            .await
+            .unwrap();
+        assert_eq!(pinned, id);
+        let err = db
+            .create_checkpoint(CheckpointScope::All, &options)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("checkpoint already exists"));
+        db.close().await.unwrap();
+
+        let admin = AdminBuilder::new(path.clone(), object_store.clone()).build();
+        let pinned_detached = uuid::Uuid::new_v4();
+        let detached_options = CheckpointOptions {
+            id: Some(pinned_detached),
+            ..CheckpointOptions::default()
+        };
+        let CheckpointCreateResult { id, .. } = admin
+            .create_detached_checkpoint(&detached_options)
+            .await
+            .unwrap();
+        assert_eq!(pinned_detached, id);
+        let err = admin
+            .create_detached_checkpoint(&detached_options)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("checkpoint already exists"));
+    }
+
+    #[tokio::test]
     async fn test_should_create_checkpoint_with_expiry() {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let path = Path::from("/tmp/test_kv_store");

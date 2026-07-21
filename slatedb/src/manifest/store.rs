@@ -2,7 +2,8 @@ use crate::checkpoint::Checkpoint;
 use crate::config::CheckpointOptions;
 use crate::error::SlateDBError;
 use crate::error::SlateDBError::{
-    CheckpointMissing, InvalidDBState, LatestTransactionalObjectVersionMissing, ManifestMissing,
+    CheckpointExists, CheckpointMissing, InvalidDBState, LatestTransactionalObjectVersionMissing,
+    ManifestMissing,
 };
 use crate::flatbuffer_types::FlatBufferManifestCodec;
 use crate::manifest::{Manifest, ManifestCore, VersionedManifest};
@@ -100,6 +101,9 @@ impl FenceableManifest {
         options: &CheckpointOptions,
     ) -> Result<Checkpoint, SlateDBError> {
         let db_state = &inner.object().core;
+        if db_state.find_checkpoint(checkpoint_id).is_some() {
+            return Err(CheckpointExists(checkpoint_id));
+        }
         let manifest_id = match options.source {
             Some(source_checkpoint_id) => {
                 let Some(source_checkpoint) = db_state.find_checkpoint(source_checkpoint_id) else {
@@ -264,6 +268,9 @@ impl StoredManifest {
         checkpoint_id: Uuid,
         options: &CheckpointOptions,
     ) -> Result<Checkpoint, SlateDBError> {
+        if manifest.core.find_checkpoint(checkpoint_id).is_some() {
+            return Err(CheckpointExists(checkpoint_id));
+        }
         let manifest_id = match options.source {
             Some(source_checkpoint_id) => {
                 let Some(source_checkpoint) = manifest.core.find_checkpoint(source_checkpoint_id)

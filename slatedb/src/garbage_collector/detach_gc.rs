@@ -270,6 +270,7 @@ mod tests {
                     lifetime: None,
                     source: None,
                     name: None,
+                    id: None,
                 },
             )
             .await
@@ -384,6 +385,7 @@ mod tests {
                     lifetime: None,
                     source: None,
                     name: None,
+                    id: None,
                 },
             )
             .await

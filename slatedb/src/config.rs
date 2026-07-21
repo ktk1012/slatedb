@@ -598,6 +598,10 @@ pub struct CheckpointOptions {
 
     /// Optionally specifies a name for the checkpoint. Can be used to list the checkpoints.
     pub name: Option<String>,
+
+    /// Optionally pins the id of the checkpoint to create instead of generating a random one.
+    /// Creation fails with `CheckpointExists` if a checkpoint with this id already exists.
+    pub id: Option<Uuid>,
 }
 
 /// Settings represents the configuration options that a user can tweak to customize
