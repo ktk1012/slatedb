@@ -38,16 +38,7 @@ pub struct StorageViewObject {
     pub path: String,
 }
 
-/// Semantic pin that keeps an external SST source manifest reachable.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct ExternalCheckpointPin {
-    pub source_db_path: String,
-    pub source_checkpoint_id: Uuid,
-    pub final_checkpoint_id: Uuid,
-    pub manifest_id: u64,
-}
-
-/// Latest manifest revision observed while resolving a checkpoint or external pin.
+/// Latest root manifest revision observed while resolving a checkpoint.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct StorageViewRevision {
     pub db_path: String,
@@ -60,7 +51,6 @@ pub struct StorageViewInventory {
     pub checkpoint_id: Uuid,
     pub checkpoint_manifest_id: u64,
     pub objects: Vec<StorageViewObject>,
-    pub external_checkpoint_pins: Vec<ExternalCheckpointPin>,
     pub observed_revisions: Vec<StorageViewRevision>,
 }
 
@@ -68,7 +58,7 @@ pub struct StorageViewInventory {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum StorageViewInventoryError {
-    /// A latest manifest changed while the inventory graph was being captured.
+    /// The root latest manifest changed while the inventory was being captured.
     #[error(
         "storage view revision changed. db_path=`{db_path}`, expected=`{expected}`, observed=`{observed}`"
     )]
@@ -77,7 +67,7 @@ pub enum StorageViewInventoryError {
         expected: u64,
         observed: u64,
     },
-    /// An explicit root or external checkpoint no longer exists.
+    /// The explicit root checkpoint no longer exists.
     #[error("checkpoint missing. db_path=`{db_path}`, checkpoint_id=`{checkpoint_id}`")]
     CheckpointMissing {
         db_path: String,
@@ -99,10 +89,10 @@ impl From<SlateDBError> for StorageViewInventoryError {
 
 impl Admin {
     /// Resolve an explicit checkpoint to its exact manifest, bounded WAL, local SST,
-    /// external SST, and external final-checkpoint pin graph.
+    /// and external SST physical files.
     ///
-    /// The method rejects a capture if any latest manifest revision changes while
-    /// the graph is being read. Callers may retry from the beginning.
+    /// The method rejects a capture if the root latest manifest revision changes
+    /// while the files are being resolved. Callers may retry from the beginning.
     pub async fn read_storage_view_inventory(
         &self,
         checkpoint_id: Uuid,
@@ -150,39 +140,8 @@ impl Admin {
             }
         }
 
-        let mut external_checkpoint_pins = BTreeSet::new();
         let mut observed_revisions = BTreeMap::new();
         observed_revisions.insert(self.path.to_string(), root_latest.id());
-
-        for external_db in checkpoint_manifest
-            .external_dbs
-            .iter()
-            .filter(|external_db| !external_db.sst_ids.is_empty())
-        {
-            let final_checkpoint_id =
-                external_db
-                    .final_checkpoint_id
-                    .ok_or(StorageViewInventoryError::InvalidGraph {
-                        reason: "external DB is missing its final checkpoint",
-                    })?;
-            let source_path = Path::from(external_db.path.clone());
-            let source_store = ManifestStore::new(&source_path, main_store.clone());
-            let source_latest = source_store.read_latest_manifest().await?;
-            let final_checkpoint = find_checkpoint(
-                source_latest.checkpoints(),
-                final_checkpoint_id,
-                &source_path,
-            )?;
-
-            objects.insert(manifest_object(&source_path, final_checkpoint.manifest_id));
-            external_checkpoint_pins.insert(ExternalCheckpointPin {
-                source_db_path: external_db.path.clone(),
-                source_checkpoint_id: external_db.source_checkpoint_id,
-                final_checkpoint_id,
-                manifest_id: final_checkpoint.manifest_id,
-            });
-            observed_revisions.insert(external_db.path.clone(), source_latest.id());
-        }
 
         verify_revisions(&self.path, &self.object_stores, &observed_revisions).await?;
 
@@ -190,7 +149,6 @@ impl Admin {
             checkpoint_id,
             checkpoint_manifest_id: checkpoint.manifest_id,
             objects: objects.into_iter().collect(),
-            external_checkpoint_pins: external_checkpoint_pins.into_iter().collect(),
             observed_revisions: observed_revisions
                 .into_iter()
                 .map(|(db_path, manifest_id)| StorageViewRevision {
@@ -276,8 +234,13 @@ async fn verify_revisions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::CheckpointOptions;
+    use crate::db::builder::AdminBuilder;
+    use crate::db_state::{SortedRun, SsTableHandle, SsTableInfo, SsTableView};
+    use crate::format::sst::SST_FORMAT_VERSION_LATEST;
     use crate::manifest::store::StoredManifest;
     use crate::manifest::{ExternalDb, Manifest, ManifestCore};
+    use bytes::Bytes;
     use object_store::memory::InMemory;
     use object_store::ObjectStore;
     use slatedb_common::clock::DefaultSystemClock;
@@ -319,6 +282,78 @@ mod tests {
                 checkpoint_id: observed,
             }) if db_path == "root" && observed == checkpoint_id
         ));
+    }
+
+    #[tokio::test]
+    async fn external_ssts_do_not_require_source_manifest_or_final_checkpoint() {
+        let root = Path::from("root");
+        let source = Path::from("missing-source");
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let manifest_store = Arc::new(ManifestStore::new(&root, store.clone()));
+        let external_sst_id = SsTableId::Compacted(Ulid::from_parts(1, 0));
+        let external_view = SsTableView::new_projected(
+            external_sst_id.unwrap_compacted_id(),
+            SsTableHandle::new(
+                external_sst_id,
+                SST_FORMAT_VERSION_LATEST,
+                SsTableInfo {
+                    first_entry: Some(Bytes::from_static(b"key")),
+                    ..SsTableInfo::default()
+                },
+            ),
+            None,
+        );
+        let mut core = ManifestCore::new();
+        Arc::make_mut(&mut core.tree).compacted.push(SortedRun {
+            id: 1,
+            sst_views: vec![external_view],
+        });
+        let mut manifest = Manifest::initial(core);
+        manifest.external_dbs.push(ExternalDb {
+            path: source.to_string(),
+            source_checkpoint_id: Uuid::from_u128(1),
+            final_checkpoint_id: None,
+            sst_ids: vec![external_sst_id],
+        });
+        let mut stored = StoredManifest::store_uninitialized_clone(
+            manifest_store,
+            manifest,
+            Arc::new(DefaultSystemClock::new()),
+        )
+        .await
+        .unwrap();
+        let checkpoint = stored
+            .write_checkpoint(Uuid::from_u128(2), &CheckpointOptions::default())
+            .await
+            .unwrap();
+        let admin = AdminBuilder::new(root.clone(), store).build();
+
+        let inventory = admin
+            .read_storage_view_inventory(checkpoint.id)
+            .await
+            .unwrap();
+
+        assert!(inventory
+            .objects
+            .contains(&manifest_object(&root, checkpoint.manifest_id)));
+        assert!(inventory.objects.contains(&StorageViewObject {
+            store: StorageViewObjectStore::Main,
+            kind: StorageViewObjectKind::SortedRun,
+            path: PathResolver::new(source.clone())
+                .table_path(&external_sst_id)
+                .to_string(),
+        }));
+        assert!(!inventory.objects.iter().any(|object| {
+            object.kind == StorageViewObjectKind::Manifest
+                && object.path.starts_with(source.as_ref())
+        }));
+        assert_eq!(
+            inventory.observed_revisions,
+            vec![StorageViewRevision {
+                db_path: root.to_string(),
+                manifest_id: 2,
+            }]
+        );
     }
 
     #[tokio::test]
